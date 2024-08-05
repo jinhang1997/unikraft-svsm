@@ -345,6 +345,7 @@ int uk_sev_setup_ghcb(void)
 	if (unlikely(rc))
 		return rc;
 
+	//while (1);
 	memset(&ghcb_page, 0, sizeof(struct ghcb));
 
 	ghcb_paddr = ukplat_virt_to_phys(&ghcb_page);

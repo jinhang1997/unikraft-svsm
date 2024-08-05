@@ -105,14 +105,18 @@ UK_TESTCASE(uknofault, test_nofault_probe_rw)
 	rc = ukplat_page_set_attr(pt, TEST_MAP_BASE, 1,
 				  PAGE_ATTR_PROT_RW, 0);
 	nf_bug_on(rc != 0);
+	uk_pr_debug("after ukplat_page_set_attr\n");
 
-	*((unsigned long *)TEST_MAP_BASE) = 0xdeadb0b0;
+	//*((unsigned long *)TEST_MAP_BASE) = 0xdeadb0b0;
 
+	uk_pr_debug("before len = uk_nofault_probe_rw(TEST_MAP_BASE, 1, 0);\n");
 	len = uk_nofault_probe_rw(TEST_MAP_BASE, 1, 0);
+	uk_pr_debug("after len = uk_nofault_probe_rw(TEST_MAP_BASE, 1, 0);\n");
 	UK_TEST_EXPECT_SNUM_EQ(len, 1);
 
 	len = uk_nofault_probe_rw(TEST_MAP_END - 1244, PAGE_SIZE, 0);
 	UK_TEST_EXPECT_SNUM_EQ(len, 1244);
+	uk_pr_debug("after uk_nofault_probe_rw\n");
 
 	/* Map another page and leave a hole of one page to check if
 	 * continuation works

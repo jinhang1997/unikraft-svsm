@@ -482,11 +482,18 @@ struct virtqueue *virtqueue_create(__u16 queue_id, __u16 nr_descs, __u16 align,
 		goto err_freevq;
 	}
 #endif /* !CONFIG_LIBUKVMEM */
+
 #if CONFIG_LIBUKSEV
+#if CONFIG_LIBUKVMEM
 	uk_sev_set_memory_shared(vaddr,
 				 ring_size >> PAGE_SHIFT);
-
+#else
+#define PAGE_SHIFT			12
+	uk_sev_set_memory_shared(vrq->vring_mem,
+				 ring_size >> PAGE_SHIFT);
 #endif
+#endif
+
 	memset(vrq->vring_mem, 0, ring_size);
 	virtqueue_vring_init(vrq, nr_descs, align);
 
@@ -497,6 +504,8 @@ struct virtqueue *virtqueue_create(__u16 queue_id, __u16 nr_descs, __u16 align,
 	vq->vq_notify_host = notify;
 	vq->uses_event_idx =
 	    VIRTIO_FEATURE_HAS(vdev->features, VIRTIO_F_EVENT_IDX);
+		
+	uk_pr_debug("virtqueue created: vq->queue_id = %d\n", vq->queue_id);
 	return vq;
 
 err_freevq:

@@ -862,7 +862,7 @@ static int virtio_pci_map_cap(struct pci_device *pci_dev,
 		/* 			 mapped_bar->size / __PAGE_SIZE); */
 #endif
 	}
-	uk_pr_info("start: %#" PRIx64 ",size: %lx, offset: %lx, length: %lx\n",
+	uk_pr_info("start: %#" __PRIx64 ",size: %lx, offset: %lx, length: %lx\n",
 		   (unsigned long)mapped_bar->start, mapped_bar->size, offset,
 		   length);
 
@@ -874,7 +874,7 @@ static int virtio_pci_map_cap(struct pci_device *pci_dev,
 
 
 
-	uk_pr_debug("Mapped cap %d to BAR %d at %#" PRIx64 "\n", cap, bar_idx,
+	uk_pr_debug("Mapped cap %d to BAR %d at %#" __PRIx64 "\n", cap, bar_idx,
 		    (unsigned long)*mapped_addr);
 
 	return 0;

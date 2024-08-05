@@ -123,7 +123,10 @@ void _ukplat_entry(struct lcpu *lcpu, struct ukplat_bootinfo *bi)
 
 #ifdef CONFIG_LIBUKSEV
 	/* Setting up the GHCB requires that we have the page table set up */
+	/* MEMO: When SVSM is loaded, the program failed here */
+	//while (1);
 	rc = uk_sev_setup_ghcb();
+	//while (1);
 	if (unlikely(rc))
 		UK_CRASH("GHCB setup failed: %d\n", rc);
 

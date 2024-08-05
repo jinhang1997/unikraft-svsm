@@ -140,10 +140,12 @@ __sz uk_nofault_memcpy(char *dst, const char *src, __sz len,
 	__sz l = len;
 	__sz bytes = 0;
 
+	uk_pr_debug("l = %lu\n", l);
 	if (flags & UK_NOFAULTF_NOPAGING)
 		nf_disable_paging(&ps);
 
 	do {
+		uk_pr_debug("l = %lu\n", l);
 		nf_memcpy_loop(dst, src, l, __u64, FAULT_1);
 		nf_memcpy_loop(dst, src, l, __u32, FAULT_1);
 		nf_memcpy_loop(dst, src, l, __u16, FAULT_1);
