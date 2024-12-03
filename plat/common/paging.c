@@ -38,6 +38,7 @@
 
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
 
 #include <uk/config.h>
 #include <uk/arch/limits.h>
@@ -49,6 +50,10 @@
 #include <uk/plat/common/sections.h>
 #include <uk/plat/common/bootinfo.h>
 #include <uk/falloc.h>
+
+#ifdef CONFIG_LIBUKSEV
+#include <uk/sev.h>
+#endif
 
 #define __PLAT_CMN_ARCH_PAGING_H__
 #if defined CONFIG_ARCH_ARM_64
@@ -90,6 +95,9 @@ static unsigned int pg_page_largest_level = PAGE_LEVEL;
  */
 static struct uk_pagetable kernel_pt;
 static struct uk_pagetable *pg_active_pt;
+
+__u64 pte_batch_count;
+volatile struct svsm_make_page_pte_entry pte_to_svsm_entry[PTE_BATCH_ENTRY_MAX]; 
 
 struct uk_pagetable *ukplat_pt_get_active(void)
 {
@@ -545,16 +553,27 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 		alloc_pmem = 1;
 
 	if (!(flags & PAGE_FLAG_FORCE_SIZE)) {
+		// snprintf(uk_sev_svsm_caa_buffer(),
+		// 	MAX_SVSM_BUFFER_SIZE, "level %d < max_lvl %d", level, max_lvl);
+		// uk_sev_svsm_custom_temp_print_msr();
 		if (level < max_lvl)
 			max_lvl = level;
 
 		to_lvl = pg_largest_level(vaddr, paddr, len, max_lvl);
+		// snprintf(uk_sev_svsm_caa_buffer(),
+		// 	MAX_SVSM_BUFFER_SIZE, "pg_largest_level(len %016lx max_lvl %d) -> to_lvl %d", len, max_lvl, to_lvl);
+		// uk_sev_svsm_custom_temp_print_msr();
 	}
+
+	snprintf(uk_sev_svsm_caa_buffer(),
+		MAX_SVSM_BUFFER_SIZE, "len %016lx lvl %d to_lvl %d", len, lvl, to_lvl);
+	uk_sev_svsm_custom_temp_print_msr();
 
 	UK_ASSERT(lvl >= to_lvl);
 	pt_vaddr_cache[lvl] = pt_vaddr;
 
 	pte_idx = PT_Lx_IDX(vaddr, lvl);
+	// ((0xff0000 0000) >> (12 + (9 * (1)))) & ((1UL << 9) - 1);
 	page_size = PAGE_Lx_SIZE(lvl);
 	do {
 		/* This loop is responsible for walking the page table down
@@ -564,6 +583,12 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 		while (lvl > to_lvl) {
 			/* We are too high and need to walk further down */
 			rc = ukarch_pte_read(pt_vaddr, lvl, pte_idx, &pte);
+
+			snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+				"ukarch_pte_read (pt_vaddr %016lx lvl %d idx %016x pte %016lx)", 
+				pt_vaddr, lvl, pte_idx, pte);
+			uk_sev_svsm_custom_temp_print_msr();
+
 			if (unlikely(rc))
 				return rc;
 
@@ -578,6 +603,11 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 					if (!mapx)
 						return -EEXIST;
 
+					snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+						"pg_page_split (pt %016lx, pt_vaddr %016lx, vaddr %016lx, level %d", 
+						(__u64)pt, pt_vaddr, vaddr, lvl);
+					uk_sev_svsm_custom_temp_print_msr();
+
 					rc = pg_page_split(pt, pt_vaddr, vaddr,
 							   lvl);
 					if (unlikely(rc))
@@ -587,6 +617,11 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 				}
 
 				pt_vaddr = pgarch_pt_pte_to_vaddr(pt, pte, lvl);
+
+				snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+					"pgarch_pt_pte_to_vaddr (pt %016lx pte %016lx level %d) -> pt_vaddr %016lx",
+					(__u64)pt, pte, lvl, pt_vaddr);
+				uk_sev_svsm_custom_temp_print_msr();
 			} else {
 				/* There is nothing here, not even a page table.
 				 * So allocate a new one and link it.
@@ -605,6 +640,12 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 							   pte, template_level);
 				rc = ukarch_pte_write(pt_vaddr_cache[lvl], lvl,
 						      pte_idx, pte);
+
+				snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+					"ukarch_pte_write (pt_vaddr pt_vaddr_cache[lvl %d] %016lx, pte_idx %016x, pte %016lx", 
+					lvl, pt_vaddr_cache[lvl], pte_idx, pte);
+				uk_sev_svsm_custom_temp_print_msr();
+
 				if (unlikely(rc)) {
 					pg_pt_free(pt, pt_vaddr, lvl - 1);
 					return rc;
@@ -622,6 +663,9 @@ static int pg_page_mapx(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 
 		UK_ASSERT(lvl == to_lvl);
 		UK_ASSERT(PAGE_Lx_HAS(lvl));
+		// snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+		// 	"reached lvl %d", lvl);
+		// uk_sev_svsm_custom_temp_print_msr();
 
 		/* At this point, we are at the target level and know that
 		 * pages can be mapped at this level.
@@ -728,6 +772,31 @@ TOO_BIG:
 		UK_ASSERT(PAGE_Lx_ALIGNED(PT_Lx_PTE_PADDR(pte, lvl), lvl));
 
 		rc = ukarch_pte_write(pt_vaddr, lvl, pte_idx, pte);
+		pte_batch_count++;
+		if (pte_batch_count < PTE_BATCH_ENTRY_MAX)
+		{
+			// // pte_to_svsm[pte_batch_count] = pte;
+			// pte_to_svsm_entry[pte_batch_count].pt_paddr = x86_directmap_vaddr_to_paddr(pt_vaddr);
+			// pte_to_svsm_entry[pte_batch_count].lvl = lvl;
+			// pte_to_svsm_entry[pte_batch_count].idx = pte_idx;
+			// pte_to_svsm_entry[pte_batch_count].pte = pte;
+			// pte_batch_count++;
+		}
+		else
+		{
+			// snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+			// 	"#%ld/%ld reach max batch pt entries", pte_batch_count, PTE_BATCH_ENTRY_MAX);
+			// uk_sev_svsm_custom_temp_print_msr();
+		}
+		
+		if (pte_batch_count <= 16)
+		{
+			snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+				"#%02ld vaddr %016lx ukarch_pte_write: (pt_vaddr %016lx lvl %d pte_idx %08x pte %016lx)", 
+				pte_batch_count, vaddr, pt_vaddr, lvl, pte_idx, pte);
+			uk_sev_svsm_custom_temp_print_msr();
+		}
+
 		if (unlikely(rc)) {
 			if (alloc_pmem &&
 			    !PT_Lx_PTE_PRESENT(orig_pte, lvl))
@@ -749,7 +818,12 @@ NEXT_PTE:
 		len -= page_size;
 
 		if (len == 0)
+		{
+			snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+					"%ld pages written.", pte_batch_count);
+			uk_sev_svsm_custom_temp_print_msr();
 			break;
+		}	
 
 		UK_ASSERT(vaddr <= __VADDR_MAX - page_size);
 		UK_ASSERT(paddr <= __PADDR_MAX - page_size);
@@ -844,6 +918,11 @@ int ukplat_page_mapx(struct uk_pagetable *pt, __vaddr_t vaddr,
 
 	UK_ASSERT(pt->pt_vbase != __VADDR_INV);
 	UK_ASSERT(pt->pt_pbase != __PADDR_INV);
+
+	snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+		"pg_page_mapx(pt %016lx pt_vaddr %016lx pt_paddr %016lx level %d vaddr %016lx paddr %016lx)", 
+		(__u64)pt, pt->pt_vbase, pt->pt_pbase, PT_LEVELS - 1, vaddr, paddr);
+	uk_sev_svsm_custom_temp_print_msr();
 
 	return pg_page_mapx(pt, pt->pt_vbase, PT_LEVELS - 1, vaddr, paddr, len,
 			    attr, flags, PT_Lx_PTE_INVALID(PAGE_LEVEL),
@@ -1462,6 +1541,12 @@ int ukplat_paging_init(void)
 		UK_ASSERT(mrd->len);
 		UK_ASSERT(!(mrd->len & ~PAGE_MASK));
 
+		snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+			"memory region vbase %016lx len %016lx", mrd->vbase, mrd->len);
+		uk_sev_svsm_custom_temp_print_msr();
+		// uk_sev_svsm_custom_make_page_msr(0, mrd->vbase, mrd->pbase, 
+		// 			mrd->len, 0, 0);
+
 		/* Not mapped */
 		mrd->vbase = __U64_MAX;
 		mrd->flags &= ~UKPLAT_MEMRF_PERMS;
@@ -1524,8 +1609,26 @@ int ukplat_paging_init(void)
 
 		prot  = bootinfo_to_page_attr(mrd->flags);
 
+		snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+			"------------------------------------------------------------------");
+		uk_sev_svsm_custom_temp_print_msr();
+
+		snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, 
+			"ukplat_page_map (pt %016lx, va %016lx, pa %016lx, pages %016lx, attr %016lx)",
+			(__u64)&kernel_pt, vaddr, paddr, len >> PAGE_SHIFT, prot);
+		uk_sev_svsm_custom_temp_print_msr();
+
+		memset((void *)pte_to_svsm_entry, 0, sizeof(pte_to_svsm_entry));
+		pte_batch_count = 0;
+
 		rc = ukplat_page_map(&kernel_pt, vaddr, paddr,
 				     len >> PAGE_SHIFT, prot, 0);
+
+		// __u8 *caa_pte_list = uk_sev_svsm_caa_buffer() + sizeof(struct svsm_make_page_call);
+		// memcpy(caa_pte_list, (void *)pte_to_svsm_entry, pte_batch_count * sizeof(struct svsm_make_page_pte_entry));
+		// uk_sev_svsm_custom_make_page_msr((__u64)&kernel_pt, vaddr, paddr, 
+		// 			len >> PAGE_SHIFT, prot, 0, pte_batch_count);
+
 		if (unlikely(rc))
 			return rc;
 	}

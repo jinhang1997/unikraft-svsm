@@ -152,7 +152,11 @@ static int uk_efi_md_to_bi_mrd(struct uk_efi_mem_desc *const md,
 	case UK_EFI_PAL_CODE:
 	case UK_EFI_PERSISTENT_MEMORY:
 		mrd->type = UKPLAT_MEMRT_RESERVED;
-		mrd->flags = UKPLAT_MEMRF_READ | UKPLAT_MEMRF_MAP;
+		//mrd->flags = UKPLAT_MEMRF_READ | UKPLAT_MEMRF_MAP;
+		/* TODO: We give all reserved memregion write privilege to simplify 
+		 * memory range check for svsm_caa_gpa, but this should be done later
+		 */
+		mrd->flags = UKPLAT_MEMRF_READ | UKPLAT_MEMRF_WRITE | UKPLAT_MEMRF_MAP;
 
 		break;
 	case UK_EFI_MEMORY_MAPPED_IO:
@@ -672,6 +676,7 @@ void __uk_efi_api __noreturn uk_efi_main(uk_efi_hndl_t self_hndl,
 					 struct uk_efi_sys_tbl *sys_tbl)
 {
 	uk_efi_init_vars(self_hndl, sys_tbl);
+	uk_pr_debug("before uk_efi_cls\n");
 	uk_efi_cls();
 	uk_efi_reset_attack_mitigation_enable();
 

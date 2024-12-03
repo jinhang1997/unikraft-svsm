@@ -28,6 +28,9 @@
 #include <uk/print.h>
 #include <uk/page.h>
 
+#include <kvm/efi.h>
+#include <uk/plat/common/bootinfo.h>
+
 #include <kvm-x86/traps.h>
 
 #include <uk/event.h>
@@ -40,6 +43,18 @@ static struct seg_gate_desc64 sev_boot_idt[IDT_NUM_ENTRIES] __align(8);
 static struct desc_table_ptr64 boot_idtptr;
 static struct ghcb ghcb_page __align(__PAGE_SIZE);
 
+static struct uk_efi_cc_blob_tbl *cc_blob_tbl;
+static struct svsm_caa *svsm_caa_gpa;
+int svsm_present = 0;
+
+static inline int uk_sev_svsm_present()
+{
+#ifdef CONFIG_X86_AMD64_FEAT_SEV_ES
+	return svsm_present;
+#else
+	return 0;
+#endif
+}
 
 /* Debug printing is only available after GHCB is initialized. */
 int ghcb_initialized = 1;
@@ -212,6 +227,9 @@ int do_vmm_comm_exception_no_ghcb(struct __regs *regs,
 int uk_sev_set_pages_state(__vaddr_t vstart, __paddr_t pstart, unsigned long num_pages,
 			   int page_state)
 {
+	static int counter_shared = 0;
+	static int counter_private = 0;
+	static int counter_call = 0;
 
 	vstart = PAGE_ALIGN_DOWN(vstart);
 	pstart = PAGE_ALIGN_DOWN(pstart);
@@ -222,20 +240,48 @@ int uk_sev_set_pages_state(__vaddr_t vstart, __paddr_t pstart, unsigned long num
 		__paddr_t paddr = pstart + i * PAGE_SIZE;
 		__paddr_t vaddr = vstart + i * PAGE_SIZE;
 
+		uk_pr_debug("uk_sev_set_pages_state: uk_sev_ghcb_initialized: %d\n", uk_sev_ghcb_initialized());
+		// TODO: When kernel running in VMPL1 (a.k.a, SVSM is present), PVALIDATE inst. should
+		// only be invoked by SVSM running at VMPL0 (refer to doc No. 24594, page 426)
 		if (page_state == SEV_GHCB_MSR_SNP_PSC_PG_SHARED) {
-			uk_pr_info("Pvalidating vaddr 0x%lx paddr 0x%lx shared\n", vaddr,
-				   paddr);
+			counter_shared++;
 
 			/* Un-validate page to make it shared */
-			rc = pvalidate(vaddr, PVALIDATE_PAGE_SIZE_4K, 0);
+			if (svsm_present)
+			{
+				// MEMO: According to https://lkml.org/lkml/2024/1/26/1092,
+				// When an SVSM is present, use the SVSM_CORE_PVALIDATE call to perform
+				// memory validation instead of issuing the PVALIDATE instruction directly.
+				uk_pr_info("[count: %d] Pvalidating vaddr 0x%lx paddr 0x%lx shared by SVSM\n", 
+					counter_shared, vaddr, paddr);
+				rc = uk_sev_svsm_core_pvalidate_msr(vaddr, PVALIDATE_PAGE_SIZE_4K, 0);
+			}
+			else
+			{
+				uk_pr_info("[count: %d] Pvalidating vaddr 0x%lx paddr 0x%lx shared by instruction\n", 
+					counter_shared, vaddr, paddr);
+				rc = pvalidate(vaddr, PVALIDATE_PAGE_SIZE_4K, 0);
+			}
+
 			if (unlikely(rc))
 			{
 				uk_pr_warn("pvalidate failed, error code: %d.\n", rc);
 				return rc;
 			}
+			//while (1);
 		}
 
+		/* 
+		 * MEMO: This GHCB MSR invoke is given parameters
+		 * GHCBInfo: 0x014 Page State Change Request
+		 * GHCBData:
+		 * 	 GHCBData[55:52] – Page operation `page_state`  
+		 *	 GHCBData[51:12] – Guest physical frame number `paddr >> PAGE_SHIFT`
+		 * to change the page state to `page_state`.
+		 */
 		uk_pr_info("Requesting PSC\n");
+		counter_call++;
+		uk_pr_info("[count: %d] Requesting PSC\n", counter_call);
 		val = uk_sev_ghcb_msr_invoke(SEV_GHCB_MSR_SNP_PSC_REQ_VAL(
 		    page_state, paddr >> PAGE_SHIFT));
 
@@ -249,9 +295,22 @@ int uk_sev_set_pages_state(__vaddr_t vstart, __paddr_t pstart, unsigned long num
 		}
 
 		if (page_state == SEV_GHCB_MSR_SNP_PSC_PG_PRIVATE) {
-			uk_pr_info("Pvalidating vaddr 0x%lx paddr 0x%lx private\n", vaddr, paddr);
+			counter_private++;
+			uk_pr_info("[count: %d] Pvalidating vaddr 0x%lx paddr 0x%lx private\n", 
+				counter_private, vaddr, paddr);
+			
+			if (svsm_present)
+			{
+				// MEMO: According to https://lkml.org/lkml/2024/1/26/1092,
+				// When an SVSM is present, use the SVSM_CORE_PVALIDATE call to perform
+				// memory validation instead of issuing the PVALIDATE instruction directly.
+				rc = uk_sev_svsm_core_pvalidate_msr(vaddr, PVALIDATE_PAGE_SIZE_4K, 1);
+			}
+			else
+			{
+				rc = pvalidate(vaddr, PVALIDATE_PAGE_SIZE_4K, 1);
+			}
 
-			rc = pvalidate(vaddr, PVALIDATE_PAGE_SIZE_4K, 1);
 			if (unlikely(rc))
 			{
 				uk_pr_warn("pvalidate failed, error code: %d.\n", rc);
@@ -339,13 +398,14 @@ int uk_sev_setup_ghcb(void)
 	int rc;
 	__paddr_t ghcb_paddr;
 
+	// while (1);
 	rc = uk_sev_set_memory_shared((__vaddr_t)&ghcb_page,
 				      sizeof(struct ghcb) / __PAGE_SIZE);
 
 	if (unlikely(rc))
 		return rc;
 
-	//while (1);
+	// while (1);
 	memset(&ghcb_page, 0, sizeof(struct ghcb));
 
 	ghcb_paddr = ukplat_virt_to_phys(&ghcb_page);
@@ -367,6 +427,8 @@ int uk_sev_setup_ghcb(void)
 		return -1;
 	}
 #endif /* CONFIG_X86_AMD64_FEAT_SEV_ES */
+	uk_pr_debug(" GHCB Virtual Address: 0x%016lx\n", (__u64)&ghcb_page);
+	uk_pr_debug("GHCB Physical Address: 0x%016lx\n", (__u64)ukplat_virt_to_phys(&ghcb_page));
 
 	return 0;
 }
@@ -851,3 +913,439 @@ int uk_sev_early_vc_handler_init(void)
 
 
 UK_EVENT_HANDLER(UKARCH_TRAP_VC, uk_sev_handle_vc);
+
+int uk_sev_svsm_discover(__u64 efi_st)
+{
+	struct uk_efi_cfg_tbl *ct;
+	struct uk_efi_sys_tbl *uk_efi_st;
+	struct snp_secrets_page_layout *snp_sp;
+	__u64 i;
+	//__u32 fms_cpuid;
+
+	uk_efi_st = (struct uk_efi_sys_tbl*)efi_st;
+	uk_pr_debug("Finding uk_efi_st->configuration_table for ccblob...\n");
+	for (i = 0; i < uk_efi_st->number_of_table_entries; i++) {
+		ct = &uk_efi_st->configuration_table[i];
+
+		if (!memcmp(&ct->vendor_guid,
+			    UK_EFI_CC_BLOB_GUID,
+			    sizeof(ct->vendor_guid))) {
+			
+			uk_pr_debug("Found UK_EFI_CC_BLOB_GUID in configuration_table[%ld].\n", i);
+			cc_blob_tbl = ct->vendor_table;
+			uk_pr_debug("                        Magic:\t0x%08x (Should be: 0x%08x)\n", cc_blob_tbl->magic, CC_BLOB_SEV_HDR_MAGIC);
+			uk_pr_debug("                      Version:\t0x%08x (%d)\n", cc_blob_tbl->version, cc_blob_tbl->version);
+			uk_pr_debug("Secrets Page Physical Address:\t0x%016lx\n", cc_blob_tbl->secrets_phys);
+			uk_pr_debug("          Secrets Page Length:\t0x%08x (%d)\n", cc_blob_tbl->secrets_len, cc_blob_tbl->secrets_len);
+			uk_pr_debug("       CPUID Physical Address:\t0x%016lx\n", cc_blob_tbl->cpuid_phys);
+			uk_pr_debug("                 CPUID Length:\t0x%08x (%d)\n", cc_blob_tbl->cpuid_len, cc_blob_tbl->cpuid_len);
+			break;
+		}
+	}
+
+	snp_sp = (struct snp_secrets_page_layout *)cc_blob_tbl->secrets_phys;
+	uk_pr_debug("Contents in Secrets Page starting from 0x%016lx:\n", (__u64)snp_sp);
+	uk_pr_debug("Version: 0x%08x (%d)\n", snp_sp->version, snp_sp->version);
+	uk_pr_debug(" IMI_EN: 0x%02x (%d)\n", snp_sp->imien, snp_sp->imien);
+	uk_pr_debug("    FMS: 0x%08x\n", snp_sp->fms);
+	//uk_sev_cpuid_get_fms();
+	uk_pr_debug("Contents in SVSM field:\n");
+	uk_pr_debug("       SVSM Base: 0x%016lx\n", snp_sp->svsm_base);
+	uk_pr_debug("       SVSM Size: 0x%016lx\n", snp_sp->svsm_size);
+	uk_pr_debug("        SVSM CAA: 0x%016lx\n", snp_sp->svsm_caa);
+	uk_pr_debug("SVSM Max Version: 0x%08x (%d)\n", snp_sp->svsm_max_version, snp_sp->svsm_max_version);
+	uk_pr_debug(" SVSM Guest VMPL: 0x%02x (%d)\n", snp_sp->svsm_guest_vmpl, snp_sp->svsm_guest_vmpl);
+
+	if (snp_sp->svsm_size > 0)
+	{
+		svsm_caa_gpa = (struct svsm_caa *)snp_sp->svsm_caa;
+		svsm_caa_gpa->call_pending = 0;
+		svsm_present = 1;
+		//uk_pr_debug("SVSM Present: 0x%01x\n", uk_sev_svsm_present());
+
+		uk_pr_debug("Contents in CAA area starting from 0x%016lx:\n", (__u64)svsm_caa_gpa);
+		uk_pr_debug(" Call Pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+		uk_pr_debug("Mem Available: 0x%02x\n", svsm_caa_gpa->mem_available);
+	}
+	else
+	{
+		uk_pr_info("No SVSM module found.\n");
+	}
+
+	uk_pr_debug("GHCB information:\n");
+	uk_pr_debug("GHCB Address: 0x%016lx\n", (__u64)&ghcb_page);
+	uk_pr_debug("   GHCB Size: 0x%016lx (%ld)\n", sizeof(ghcb_page), sizeof(ghcb_page));
+
+	return 0;
+}
+
+int uk_sev_write_caa_pending(__u8 val)
+{
+	svsm_caa_gpa->call_pending = val;
+
+	return 0;
+}
+
+#define VMGEXIT_INST "rep; vmmcall;\n\t"
+
+int __svsm_msr_protocol(__u64 function, __u64 rcx, __u64 rdx, __u64 r8, __u64 r9)
+{
+	volatile __u64 msr_original, msr_new, msr_resp, msr_value;
+	volatile __u64 _rax, _rcx, _rdx, _r8, _r9;
+	volatile __u8 pending;
+	volatile __u64 reta = 0xffffffff, retc = 0xffffffff;
+
+	uk_debug_beacon();
+	_rax = function;
+	_rcx = rcx;
+	_rdx = rdx;
+	_r8 = r8;
+	_r9 = r9;
+
+	/* 
+	 * GHCB Run at VMPL Request/Response
+	 * VMPL = 0
+	 */
+	msr_original = uk_sev_ghcb_rdmsrl();
+	msr_value = 0x16;
+	uk_sev_ghcb_wrmsrl(msr_value);
+	msr_new = uk_sev_ghcb_rdmsrl();
+
+	uk_pr_debug("Now calling SVSM core protocol %d\n", _rax);
+	uk_pr_debug(" msr_original: 0x%016lx\n", msr_original);
+	uk_pr_debug("      msr_new: 0x%016lx\n", msr_new);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", (__u64)svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+	uk_pr_debug("          rax: 0x%016lx\n", _rax);
+	uk_pr_debug("          rcx: 0x%016lx\n", _rcx);
+
+	asm volatile("mov %4, %%r8\n\t"
+		     "mov %5, %%r9\n\t"
+		     "movb $1, %7\n\t"
+		     VMGEXIT_INST
+		     : "=a" (reta), "=c" (retc)
+		     : "a" (_rax), "c" (_rcx), "d" (_rdx), "r" (_r8), "r" (_r9), "m" (svsm_caa_gpa->call_pending)
+		     : "r8", "r9");
+
+	msr_resp = uk_sev_ghcb_rdmsrl();
+	
+	uk_pr_debug("Result of calling SVSM protocol\n");
+	uk_pr_debug("     msr_resp: 0x%016lx\n", msr_resp);
+	uk_pr_debug("    ret (rax): 0x%016lx\n", reta);
+	uk_pr_debug("          rcx: 0x%016lx\n", retc);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", (__u64)svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+
+	uk_sev_ghcb_wrmsrl(msr_original);
+	pending = 0;
+	asm volatile("xchgb %0, %1" : "+r" (pending) : "m" (svsm_caa_gpa->call_pending) : "memory");
+	if (pending)
+		reta = -EINVAL;
+
+	if (msr_resp != 0x17)
+		reta = -EINVAL;
+
+	// if (GHCB_MSR_VMPL_RESP_VAL(msr_resp) != 0)
+	// 	reta = -EINVAL;
+
+	return reta;
+}
+
+void *uk_sev_svsm_caa_buffer(void)
+{
+	// struct svsm_temp_print_call *temp_print_call_entry = svsm_caa_gpa->svsm_buffer;
+	return svsm_caa_gpa->svsm_buffer;
+}
+
+int uk_sev_svsm_core_pvalidate_msr(__u64 vaddr, __u64 rmp_psize, __u64 validate)
+{
+	struct svsm_pvalidate_call *svsm_call;
+	struct svsm_caa *svsm_caa;
+	volatile __u64 function;
+	volatile __u64 svsm_call_paddr;
+
+	struct snp_secrets_page_layout *snp_sp;
+	volatile __u64 rax, rcx, rdx, r8, r9;
+	volatile __u64 msr_value, msr_original, msr_resp;
+	volatile __u64 ret = 0xffffffff;
+
+	uk_debug_beacon();
+	svsm_caa = (struct svsm_caa *)svsm_caa_gpa;
+	svsm_call = (struct svsm_pvalidate_call *)svsm_caa->svsm_buffer;
+	svsm_call_paddr = (__u64)ukplat_virt_to_phys(svsm_call);
+
+	// uk_pr_debug("         svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	// uk_pr_debug("             svsm_caa: 0x%016lx\n", svsm_caa);
+	// uk_pr_debug("svsm_caa->svsm_buffer: 0x%016lx\n", svsm_caa->svsm_buffer);
+	// uk_pr_debug("            svsm_call: 0x%016lx\n", svsm_call);
+	// uk_pr_debug("      svsm_call_paddr: 0x%016lx\n", svsm_call_paddr);
+
+	svsm_call->entries = 1;
+	svsm_call->next    = 0;
+	svsm_call->entry[0].page_size = rmp_psize;
+	svsm_call->entry[0].action    = validate;
+	svsm_call->entry[0].ignore_cf = 0;
+	svsm_call->entry[0].pfn       = ukplat_virt_to_phys(vaddr) >> PAGE_SHIFT;
+
+	// uk_pr_debug("  entries: 0x%08x (%d)\n", svsm_call->entries, svsm_call->entries);
+	// uk_pr_debug("     next: 0x%08x (%d)\n", svsm_call->next, svsm_call->next);
+	// uk_pr_debug("page_size: 0x%08lx (%d)\n", svsm_call->entry[0].page_size, svsm_call->entry[0].page_size);
+	// uk_pr_debug("   action: 0x%08lx (%d)\n", svsm_call->entry[0].action, svsm_call->entry[0].action);
+	// uk_pr_debug("ignore_cf: 0x%08lx (%d)\n", svsm_call->entry[0].ignore_cf, svsm_call->entry[0].ignore_cf);
+	// uk_pr_debug("      pfn: 0x%016lx (%d)\n", svsm_call->entry[0].pfn, svsm_call->entry[0].pfn);
+
+	/*
+	 * SVSM_CORE_PVALIDATE call:
+	 *   RAX = 0x1 (Protocol=0, CallID=1)
+	 *   RCX = gPA of the list of requested operations
+	 */
+	rax = SVSM_CALL_INDENTIFIER(SVSM_CORE_PROTOCOL, SVSM_CORE_PVALIDATE);
+	rcx = svsm_call_paddr;
+	rdx = 0;
+	r8 = 0;
+	r9 = 0;
+	ret = 0;
+
+	// uk_debug_beacon();
+	// return __svsm_msr_protocol(function, (__u64)svsm_call, 0, 0, 0);
+
+	/* 
+	 * GHCB Run at VMPL Request/Response
+	 * VMPL = 0
+	 */
+	msr_value = 0x16; 
+	msr_original = uk_sev_ghcb_rdmsrl();
+
+	// uk_pr_debug("Now calling SVSM protocol SVSM_CORE_PVALIDATE\n");
+	// uk_pr_debug(" msr_original: 0x%016lx\n", msr_original);
+	// uk_pr_debug("    msr_value: 0x%016lx\n", msr_value);
+	// uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	// uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+	// uk_pr_debug("          rax: 0x%016lx\n", rax);
+	// uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_sev_ghcb_wrmsrl(msr_value);
+
+	asm volatile("mov %4, %%r8\n\t"
+		     "mov %5, %%r9\n\t"
+		     "movb $1, %6\n\t"
+		     VMGEXIT_INST
+		     : "=a" (ret)
+		     : "a" (rax), "c" (rcx), "d" (rdx), "r" (r8), "r" (r9), "m" (svsm_caa_gpa->call_pending)
+		     : "r8", "r9");
+	
+	msr_resp = uk_sev_ghcb_rdmsrl();
+	uk_sev_ghcb_wrmsrl(msr_original);
+
+	uk_pr_debug("Result of calling SVSM protocol SVSM_CORE_PVALIDATE\n");
+	uk_pr_debug("     msr_resp: 0x%016lx\n", msr_resp);
+	uk_pr_debug("    ret (rax): 0x%016lx\n", ret);
+	uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+
+	return ret;
+}
+
+
+int uk_sev_svsm_core_remap_ca_msr(__u64 pa)
+{
+	static struct svsm_caa *old_caa;
+	struct snp_secrets_page_layout *snp_sp;
+	volatile __u64 rax, rcx, rdx, r8, r9;
+	volatile __u64 msr_value, msr_original, msr_resp;
+	volatile __u64 ret = 0xffffffff;
+
+	/*
+	 * SVSM_CORE_REMAP_CA call:
+	 *   RAX = 0 (Protocol=0, CallID=0)
+	 *   RCX = New CAA GPA
+	 *   RDX = 0
+	 */
+	old_caa = svsm_caa_gpa;
+	rax = SVSM_CALL_INDENTIFIER(SVSM_CORE_PROTOCOL, SVSM_CORE_REMAP_CA);
+	rcx = pa;
+	rdx = 0;
+	r8 = 0;
+	r9 = 0;
+	ret = 0;
+
+	// return __svsm_msr_protocol(rax, rcx, 0, 0, 0);
+	
+	/* 
+	 * GHCB Run at VMPL Request/Response
+	 * VMPL = 0
+	 */
+	msr_value = 0x16; 
+	msr_original = uk_sev_ghcb_rdmsrl();
+
+	uk_pr_debug("Now calling SVSM protocol SVSM_CORE_REMAP_CA\n");
+	uk_pr_debug(" msr_original: 0x%016lx\n", msr_original);
+	uk_pr_debug("    msr_value: 0x%016lx\n", msr_value);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+	uk_pr_debug("          rax: 0x%016lx\n", rax);
+	uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_sev_ghcb_wrmsrl(msr_value);
+
+	asm volatile("mov %4, %%r8\n\t"
+		     "mov %5, %%r9\n\t"
+		     "movb $1, %6\n\t"
+		     VMGEXIT_INST
+		     : "=a" (ret)
+		     : "a" (rax), "c" (rcx), "d" (rdx), "r" (r8), "r" (r9), "m" (svsm_caa_gpa->call_pending)
+		     : "r8", "r9");
+	
+	msr_resp = uk_sev_ghcb_rdmsrl();
+	if (msr_resp == 0x17 && ret == 0x0)
+	{
+		svsm_caa_gpa = (struct svsm_caa *)rcx;
+	}
+
+	uk_sev_ghcb_wrmsrl(msr_original);
+
+	uk_pr_debug("Result of calling SVSM protocol SVSM_CORE_REMAP_CA\n");
+	uk_pr_debug("     msr_resp: 0x%016lx\n", msr_resp);
+	uk_pr_debug("    ret (rax): 0x%016lx\n", ret);
+	uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_pr_debug("      old_caa: 0x%016lx\n", old_caa);
+	uk_pr_debug(" call_pending: 0x%02x\n", old_caa->call_pending);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+
+	return 0;
+}
+
+
+int uk_sev_svsm_custom_make_page_msr(
+	__u64 pt_kernel, __u64 va, __u64 pa, __u64 pages, 
+	__u64 attr, __u64 flags, __u64 pte_num)
+{
+	volatile __u64 rax, rcx, rdx, r8, r9;
+	volatile __u64 msr_value, msr_original, msr_resp;
+	volatile __u64 ret = 0xffffffff, retc = 0xffffffff;
+	volatile struct svsm_make_page_call *mp_entry;
+
+	/*
+	 * SVSM_CORE_REMAP_CA call:
+	 *   RAX = 0x10 (Protocol=0, CallID=16)
+	 *   RCX = GPA
+	 *   RDX = 0
+	 */
+	rax = SVSM_CALL_INDENTIFIER(SVSM_CORE_PROTOCOL, SVSM_CUSTOM_MAKE_PAGE);
+	rcx = svsm_caa_gpa->svsm_buffer;
+	rdx = 0;
+	r8 = 0;
+	r9 = 0;
+	ret = 0;
+
+	mp_entry = svsm_caa_gpa->svsm_buffer;
+	mp_entry->pt_kernel = pt_kernel;
+	mp_entry->va = va;
+	mp_entry->pa = pa;
+	mp_entry->pages = pages;
+	mp_entry->attr = attr;
+	mp_entry->flags = flags;
+	mp_entry->pte_num = pte_num;
+	
+	/* 
+	 * GHCB Run at VMPL Request/Response
+	 * VMPL = 0
+	 */
+	msr_value = 0x16; 
+	msr_original = uk_sev_ghcb_rdmsrl();
+
+	uk_pr_debug("Now calling SVSM protocol SVSM_CUSTOM_MAKE_PAGE\n");
+	uk_pr_debug(" msr_original: 0x%016lx\n", msr_original);
+	uk_pr_debug("    msr_value: 0x%016lx\n", msr_value);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+	uk_pr_debug("          rax: 0x%016lx\n", rax);
+	uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_sev_ghcb_wrmsrl(msr_value);
+
+	asm volatile("mov %5, %%r8\n\t"
+		     "mov %6, %%r9\n\t"
+		     "movb $1, %7\n\t"
+		     VMGEXIT_INST
+		     : "=a" (ret), "=c" (retc)
+		     : "a" (rax), "c" (rcx), "d" (rdx), "r" (r8), "r" (r9), "m" (svsm_caa_gpa->call_pending)
+		     : "r8", "r9");
+	
+	msr_resp = uk_sev_ghcb_rdmsrl();
+	uk_sev_ghcb_wrmsrl(msr_original);
+
+	uk_pr_debug("Result of calling SVSM protocol SVSM_CUSTOM_MAKE_PAGE\n");
+	uk_pr_debug("     msr_resp: 0x%016lx\n", msr_resp);
+	uk_pr_debug("    ret (rax): 0x%016lx\n", ret);
+	uk_pr_debug("          rcx: 0x%016lx\n", retc);
+	uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+
+	return 0;
+}
+
+
+int uk_sev_svsm_custom_temp_print_msr(void)
+{
+	volatile __u64 rax, rcx, rdx, r8, r9;
+	volatile __u64 msr_value, msr_original, msr_resp;
+	volatile __u64 ret = 0xffffffff, retc = 0xffffffff;
+	struct svsm_temp_print_call *temp_print_call_entry;
+
+	/*
+	 * SVSM_CORE_REMAP_CA call:
+	 *   RAX = 0x10 (Protocol=0, CallID=16)
+	 *   RCX = GPA
+	 *   RDX = 0
+	 */
+	rax = SVSM_CALL_INDENTIFIER(SVSM_CORE_PROTOCOL, SVSM_CUSTOM_TEMP_PRINT);
+	rcx = svsm_caa_gpa->svsm_buffer;
+	rdx = 0;
+	r8 = 0;
+	r9 = 0;
+	ret = 0;
+
+	// uk_pr_info("str_len %d str '%s' at %016x\n", 
+	// 	rdx, svsm_caa_gpa->svsm_buffer, svsm_caa_gpa->svsm_buffer);
+
+	// return __svsm_msr_protocol(rax, rcx, 0, 0, 0);
+	
+	/* 
+	 * GHCB Run at VMPL Request/Response
+	 * VMPL = 0
+	 */
+	msr_value = 0x16; 
+	msr_original = uk_sev_ghcb_rdmsrl();
+
+	// uk_pr_debug("Now calling SVSM protocol SVSM_CUSTOM_TEMP_PRINT\n");
+	// uk_pr_debug(" svsm_caa_gpa: 0x%016lx\n", svsm_caa_gpa);
+	// uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+	// uk_pr_debug("          rax: 0x%016lx\n", rax);
+	// uk_pr_debug("          rcx: 0x%016lx\n", rcx);
+
+	uk_sev_ghcb_wrmsrl(msr_value);
+
+	asm volatile("mov %5, %%r8\n\t"
+		     "mov %6, %%r9\n\t"
+		     "movb $1, %7\n\t"
+		     VMGEXIT_INST
+		     : "=a" (ret), "=c" (retc)
+		     : "a" (rax), "c" (rcx), "d" (rdx), "r" (r8), "r" (r9), "m" (svsm_caa_gpa->call_pending)
+		     : "r8", "r9");
+	
+	msr_resp = uk_sev_ghcb_rdmsrl();
+	uk_sev_ghcb_wrmsrl(msr_original);
+
+	// uk_pr_debug("Result of calling SVSM protocol SVSM_CUSTOM_TEMP_PRINT\n");
+	// uk_pr_debug("     msr_resp: 0x%016lx\n", msr_resp);
+	// uk_pr_debug("    ret (rax): 0x%016lx\n", ret);
+	// uk_pr_debug("          rcx: 0x%016lx\n", retc);
+	// uk_pr_debug(" call_pending: 0x%02x\n", svsm_caa_gpa->call_pending);
+
+	return 0;
+}

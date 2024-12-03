@@ -27,9 +27,9 @@
 #define LAPIC_BASE_EN					(1 << 11)
 
 /* Master/Slave PIC Data Registers */
-#define PIC1_DATA					0x21
+//#define PIC1_DATA					0x21
 #define PIC1_DATA_DEFAULT_MASK				0xB8
-#define PIC2_DATA					0xA1
+//#define PIC2_DATA					0xA1
 #define PIC2_DATA_DEFAULT_MASK				0x8E
 
 extern void lcpu_start64(void *, void *) __noreturn;
@@ -108,8 +108,13 @@ void __noreturn uk_efi_jmp_to_kern()
 	if (unlikely(rc))
 		UK_CRASH("Failed initializing memory encryption\n");
 
+	//rc = uk_sev_svsm_discover(bi->efi_st);
+
 
 #ifdef CONFIG_X86_AMD64_FEAT_SEV_ES
+	/* Perform SVSM discovery */
+	uk_sev_svsm_discover(bi->efi_st);
+	
 	/* We are about to invalidates the GHCB and the #VS handler setup by
 	 * UEFI */
 

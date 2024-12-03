@@ -232,6 +232,8 @@ static inline void uk_printk_once(int lvl __unused,
 #define uk_pr_crit_once(fmt, ...)  uk_printk_once(KLVL_CRIT, (fmt), \
 						  ##__VA_ARGS__)
 
+#define uk_debug_beacon() uk_pr_debug("file: %s; line: %d; function: %s\n", __FILE__, __LINE__, __func__)
+
 /* Warning for stubbed functions */
 #define UK_WARN_STUBBED() \
 	uk_pr_warn_once("%s() stubbed\n", __func__)

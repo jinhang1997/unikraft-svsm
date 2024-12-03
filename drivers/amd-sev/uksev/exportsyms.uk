@@ -8,3 +8,9 @@ uk_sev_cpu_features_check
 ghcb_initialized
 uk_sev_set_memory_private
 uk_sev_set_memory_shared
+uk_sev_svsm_discover
+uk_sev_svsm_core_pvalidate_msr
+uk_sev_svsm_core_remap_ca_msr
+uk_sev_svsm_custom_make_page_msr
+uk_sev_svsm_caa_buffer
+uk_sev_svsm_custom_temp_print_msr

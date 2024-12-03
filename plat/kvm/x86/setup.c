@@ -123,14 +123,15 @@ void _ukplat_entry(struct lcpu *lcpu, struct ukplat_bootinfo *bi)
 
 #ifdef CONFIG_LIBUKSEV
 	/* Setting up the GHCB requires that we have the page table set up */
-	/* MEMO: When SVSM is loaded, the program failed here */
-	//while (1);
+
 	rc = uk_sev_setup_ghcb();
-	//while (1);
 	if (unlikely(rc))
 		UK_CRASH("GHCB setup failed: %d\n", rc);
 
-
+	// rc = uk_sev_svsm_core_remap_ca_msr(0x80c000);
+	// if (unlikely(rc))
+	// 	UK_CRASH("CAA remap failed: %d\n", rc);
+	// while (1);
 
 	/* Setting up APIC requires MSR access */
 	/* Initialize IRQ controller */
@@ -157,6 +158,12 @@ void _ukplat_entry(struct lcpu *lcpu, struct ukplat_bootinfo *bi)
 
 	/* Print boot information */
 	ukplat_bootinfo_print();
+
+	snprintf(uk_sev_svsm_caa_buffer(), MAX_SVSM_BUFFER_SIZE, "abcd");
+	uk_sev_svsm_custom_temp_print_msr();
+
+	// uk_sev_svsm_custom_make_page_msr(0x80c000);
+	// UK_CRASH("Development termination");;
 
 #if defined(CONFIG_HAVE_SMP) && defined(CONFIG_UKPLAT_ACPI)
 	rc = acpi_init();
