@@ -102,12 +102,13 @@ UK_TESTCASE(uknofault, test_nofault_probe_rw)
 	/* Make the page writeable. Set a sanity value so we can verify that
 	 * the rw probe does not change memory contents
 	 */
+	int attr_rw_enc = PAGE_ATTR_PROT_RW | PAGE_ATTR_ENCRYPT;
 	rc = ukplat_page_set_attr(pt, TEST_MAP_BASE, 1,
-				  PAGE_ATTR_PROT_RW, 0);
+				  attr_rw_enc, 0);
 	nf_bug_on(rc != 0);
 	uk_pr_debug("after ukplat_page_set_attr\n");
 
-	//*((unsigned long *)TEST_MAP_BASE) = 0xdeadb0b0;
+	*((unsigned long *)TEST_MAP_BASE) = 0xdeadb0b0;
 
 	uk_pr_debug("before len = uk_nofault_probe_rw(TEST_MAP_BASE, 1, 0);\n");
 	len = uk_nofault_probe_rw(TEST_MAP_BASE, 1, 0);
@@ -122,7 +123,7 @@ UK_TESTCASE(uknofault, test_nofault_probe_rw)
 	 * continuation works
 	 */
 	rc = ukplat_page_map(pt, TEST_MAP_BASE + 2 * PAGE_SIZE, __PADDR_ANY, 1,
-			     PAGE_ATTR_PROT_RW, 0);
+			     attr_rw_enc, 0);
 	nf_bug_on(rc != 0);
 
 	len = uk_nofault_probe_rw(TEST_MAP_BASE, 3 * PAGE_SIZE,
